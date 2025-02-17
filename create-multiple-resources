@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Resources:
+  # AWS Secrets Manager Secret for OTP
+  OneTimePasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: OneTimePassword2
+      Description: "Auto-generated one-time password for IAM users"
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: "password"
+        PasswordLength: 14
+        ExcludeCharacters: "\"@/"
+
+  # IAM Groups for S3 and EC2
+  S3UserGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: S3UserGroup
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetObject"
+                Resource: "*"
+
+  EC2UserGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: EC2UserGroup
+      Policies:
+        - PolicyName: EC2ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ec2:DescribeInstances"
+                Resource: "*"
+
+  # IAM Users
+  S3User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: s3-user
+      Groups:
+        - !Ref S3UserGroup
+
+  EC2User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: ec2-user
+      Groups:
+        - !Ref EC2UserGroup
+
+  # Store User Emails in SSM Parameter Store
+  S3UserEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: "/iam/users/s3-user/email"
+      Type: String
+      Value: "s3user@amalitech.com"
+
+  EC2UserEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: "/iam/users/ec2-user/email"
+      Type: String
+      Value: "ec2user@amalitech.com"
+
+  # CloudWatch Log Group for Lambda
+  LogUserDetailsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/lambda/LogUserDetails"
+      RetentionInDays: 7
+
+  # EventBridge Rule for IAM User Creation
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: NewUserCreationRule
+      EventPattern:
+        source:
+          - "aws.iam"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "iam.amazonaws.com"
+          eventName:
+            - "CreateUser"
+      Targets:
+        - Arn: !GetAtt LogUserDetailsLambda.Arn
+          Id: "LogUserDetailsTarget"
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref LogUserDetailsLambda
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaIAMUserLoggerRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: LambdaIAMUserLoggingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                  - "ssm:GetParameter"
+                  - "iam:ListUsers"
+                  - "iam:GetUser"
+                  - "iam:CreateLoginProfile"
+                  - "cloudtrail:LookupEvents"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogGroups"
+                Resource: "*"
+
+  # Lambda Function to Log User Details & Set Password
+  LogUserDetailsLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - OneTimePasswordSecret
+      - LogUserDetailsLogGroup
+    Properties:
+      FunctionName: LogUserDetails
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  # Extract user details from EventBridge event
+                  user_name = event['detail']['requestParameters']['userName']
+                  iam = boto3.client('iam')
+                  ssm = boto3.client('ssm')
+                  secret = boto3.client('secretsmanager')
+
+                  # Fetch email from SSM Parameter Store
+                  email_param = f"/iam/users/{user_name}/email"
+                  try:
+                      email = ssm.get_parameter(Name=email_param)['Parameter']['Value']
+                  except ssm.exceptions.ParameterNotFound:
+                      email = "Email not found"
+
+                  # Retrieve generated OTP from Secrets Manager
+                  try:
+                      password = json.loads(secret.get_secret_value(SecretId='OneTimePassword')['SecretString'])['password']
+                  except secret.exceptions.ResourceNotFoundException:
+                      password = "Secret not found"
+
+                  # Set IAM user password
+                  try:
+                      iam.create_login_profile(
+                          UserName=user_name,
+                          Password=password,
+                          PasswordResetRequired=True
+                      )
+                      logger.info(f"User {user_name} created with email {email} and password {password}.")
+                  except iam.exceptions.EntityAlreadyExistsException:
+                      logger.warning(f"Login profile already exists for {user_name}.")
+
+                  return {"status": "success"}
+
+              except Exception as e:
+                  logger.error(f"Error processing user creation: {str(e)}")
+                  return {"status": "error", "message": str(e)}
+
+Outputs:
+  IAMUserS3:
+    Description: "IAM User for S3"
+    Value: !Ref S3User
+  IAMUserEC2:
+    Description: "IAM User for EC2"
+    Value: !Ref EC2User
