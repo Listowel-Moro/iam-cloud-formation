@@ -1,6 +1,2 @@
 
 template-file-path: create-multiple-resources.yaml
-parameters:
-  Environment: dev
-  Password: ''
-tags: {}
