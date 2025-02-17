@@ -1,1 +1,3 @@
-
+template-file-path: create-multiple-resources.yaml
+parameters: {}
+tags: {}
